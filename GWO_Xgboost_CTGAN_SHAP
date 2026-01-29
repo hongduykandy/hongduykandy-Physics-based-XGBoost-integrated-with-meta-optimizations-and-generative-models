@@ -1,0 +1,480 @@
+import numpy as np
+import pandas as pd
+from collections import Counter
+import warnings
+warnings.filterwarnings("ignore")
+
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.metrics import (
+    roc_auc_score, classification_report, confusion_matrix,
+    f1_score, accuracy_score, precision_score, recall_score,
+    roc_curve, average_precision_score
+)
+from xgboost import XGBClassifier
+
+import shap
+
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+LABEL_COL = "Label"
+RANDOM_STATE = 20
+
+# ====== Input Excel files (training/testing points) ======
+LS_TRAIN_ORIGINAL_XLSX = "Limited_LS_train.xlsx"
+LS_TRAIN_CTGAN_XLSX    = "LS_train_CTGAN.xlsx"
+LS_TEST_XLSX           = "Test_LS.xlsx"
+
+NLS_TRAIN_XLSX         = "Limited_NL_train.xlsx"
+NLS_TEST_XLSX          = "Test_NL.xlsx"
+
+# ====== Features used in Excel ======
+FEATURE_NAMES = [
+    "DEM__m_",
+    "Slope__deg",
+    "Aspect",
+    "Curvature",
+    "TWI",
+    "TRI",
+    "Distance_t",
+    "Soil_type_",
+    "Geology_nu",
+    "Forest_den",
+    "Timper_age",
+    "Diameter",
+    "Forest_typ",
+]
+
+# ====== GWO settings ======
+N_WOLVES  = 20
+MAX_ITER  = 100
+CV_SPLITS = 10
+
+# ====== Decision threshold for reporting metrics ======
+THRESHOLD = 0.5
+
+# ====== SHAP settings ======
+SHAP_MAX_SAMPLES = 1000
+SHAP_TOP_DEP     = 10
+SHAP_DPI         = 600
+
+
+# ------------------------------------------------------------
+# 1) Load point data (Excel) and build train/test sets
+# ------------------------------------------------------------
+def load_and_build_datasets():
+    df_ls_train_original = pd.read_excel(LS_TRAIN_ORIGINAL_XLSX)
+    df_ls_train_ctgan    = pd.read_excel(LS_TRAIN_CTGAN_XLSX)
+    df_ls_test           = pd.read_excel(LS_TEST_XLSX)
+
+    df_nls_train         = pd.read_excel(NLS_TRAIN_XLSX)
+    df_nls_test          = pd.read_excel(NLS_TEST_XLSX)
+
+    # Labels
+    df_ls_train_original[LABEL_COL] = 1
+    df_ls_train_ctgan[LABEL_COL]    = 1
+    df_ls_test[LABEL_COL]           = 1
+
+    df_nls_train[LABEL_COL]         = 0
+    df_nls_test[LABEL_COL]          = 0
+
+    train_df = pd.concat([df_ls_train_original, df_ls_train_ctgan, df_nls_train], ignore_index=True)
+    test_df  = pd.concat([df_ls_test, df_nls_test], ignore_index=True)
+
+    missing = [c for c in FEATURE_NAMES if (c not in train_df.columns) or (c not in test_df.columns)]
+    if missing:
+        raise ValueError(f"Missing feature columns in Excel files: {missing}")
+
+    return train_df, test_df
+
+
+# ------------------------------------------------------------
+# 2) Prepare X, y (NO scaling)
+# ------------------------------------------------------------
+def prepare_xy(train_df, test_df):
+    X_train_df = train_df[FEATURE_NAMES].copy()
+    y_train    = train_df[LABEL_COL].astype(int).values
+
+    X_test_df  = test_df[FEATURE_NAMES].copy()
+    y_test     = test_df[LABEL_COL].astype(int).values
+
+    # Return both numpy and DataFrame for SHAP
+    X_train = X_train_df.values
+    X_test  = X_test_df.values
+
+    return X_train, y_train, X_test, y_test, X_train_df, X_test_df
+
+
+# ------------------------------------------------------------
+# 3) Imbalance handling: scale_pos_weight
+# ------------------------------------------------------------
+def compute_scale_pos_weight(y_train):
+    counter = Counter(y_train)
+    n_neg = counter.get(0, 0)
+    n_pos = counter.get(1, 0)
+    if n_pos == 0:
+        return 1.0, counter
+    return (n_neg / n_pos), counter
+
+
+# ============================================================
+# 4) GWO for XGBoost hyperparameter optimization (fitness = CV F1)
+# ============================================================
+lb = np.array([100, 10, 0.001, 0.1, 0.5, 1,   0.0,  0.0], dtype=float)
+ub = np.array([800, 50, 0.5,   0.5, 1.0, 10,  5.0, 10.0], dtype=float)
+dim = len(lb)
+
+def decode_wolf(position, scale_pos_weight):
+    pos = np.clip(position, lb, ub)
+    return {
+        "n_estimators":     int(round(pos[0])),
+        "max_depth":        int(round(pos[1])),
+        "learning_rate":    float(pos[2]),
+        "subsample":        float(pos[3]),
+        "colsample_bytree": float(pos[4]),
+        "min_child_weight": float(pos[5]),
+        "gamma":            float(pos[6]),
+        "reg_lambda":       float(pos[7]),
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "use_label_encoder": False,
+        "n_jobs": -1,
+        "tree_method": "hist",
+        "random_state": RANDOM_STATE,
+        "scale_pos_weight": float(scale_pos_weight),
+    }
+
+def fitness(position, X, y, scale_pos_weight, cv_splits=10):
+    params = decode_wolf(position, scale_pos_weight)
+    model = XGBClassifier(**params)
+
+    cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
+    f1_scores = cross_val_score(model, X, y, cv=cv, scoring="f1", n_jobs=-1)
+
+    mean_f1 = f1_scores.mean()
+    return -mean_f1, mean_f1
+
+def gwo_optimize(n_wolves, max_iter, X, y, scale_pos_weight):
+    wolves = np.random.uniform(lb, ub, size=(n_wolves, dim))
+    fit_vals = np.zeros(n_wolves)
+    f1_vals  = np.zeros(n_wolves)
+
+    for i in range(n_wolves):
+        f, f1 = fitness(wolves[i], X, y, scale_pos_weight, cv_splits=CV_SPLITS)
+        fit_vals[i] = f
+        f1_vals[i]  = f1
+
+    idx = np.argsort(fit_vals)
+    alpha_pos, alpha_fit, alpha_f1 = wolves[idx[0]].copy(), fit_vals[idx[0]], f1_vals[idx[0]]
+    beta_pos,  beta_fit            = wolves[idx[1]].copy(), fit_vals[idx[1]]
+    delta_pos, delta_fit           = wolves[idx[2]].copy(), fit_vals[idx[2]]
+
+    print(f"\nInitial alpha CV F1: {alpha_f1:.4f}")
+
+    for t in range(max_iter):
+        a = 2 - t * (2 / max_iter)  # 2 -> 0
+
+        for i in range(n_wolves):
+            Xpos = wolves[i].copy()
+
+            for d in range(dim):
+                # alpha
+                r1, r2 = np.random.rand(), np.random.rand()
+                A1 = 2*a*r1 - a
+                C1 = 2*r2
+                D_alpha = abs(C1*alpha_pos[d] - Xpos[d])
+                X1 = alpha_pos[d] - A1*D_alpha
+
+                # beta
+                r1, r2 = np.random.rand(), np.random.rand()
+                A2 = 2*a*r1 - a
+                C2 = 2*r2
+                D_beta = abs(C2*beta_pos[d] - Xpos[d])
+                X2 = beta_pos[d] - A2*D_beta
+
+                # delta
+                r1, r2 = np.random.rand(), np.random.rand()
+                A3 = 2*a*r1 - a
+                C3 = 2*r2
+                D_delta = abs(C3*delta_pos[d] - Xpos[d])
+                X3 = delta_pos[d] - A3*D_delta
+
+                Xpos[d] = (X1 + X2 + X3) / 3.0
+
+            wolves[i] = np.clip(Xpos, lb, ub)
+
+        # re-evaluate
+        for i in range(n_wolves):
+            f, f1 = fitness(wolves[i], X, y, scale_pos_weight, cv_splits=CV_SPLITS)
+            fit_vals[i] = f
+            f1_vals[i]  = f1
+
+        idx = np.argsort(fit_vals)
+
+        if fit_vals[idx[0]] < alpha_fit:
+            alpha_fit = fit_vals[idx[0]]
+            alpha_pos = wolves[idx[0]].copy()
+            alpha_f1  = f1_vals[idx[0]]
+
+        if fit_vals[idx[1]] < beta_fit:
+            beta_fit = fit_vals[idx[1]]
+            beta_pos = wolves[idx[1]].copy()
+
+        if fit_vals[idx[2]] < delta_fit:
+            delta_fit = fit_vals[idx[2]]
+            delta_pos = wolves[idx[2]].copy()
+
+        print(f"Iter {t+1:02d}/{max_iter} | Best CV F1: {alpha_f1:.4f}")
+
+    return alpha_pos, alpha_f1
+
+
+# ------------------------------------------------------------
+# 5) Train final model + evaluation (TEST and TRAIN)
+# ------------------------------------------------------------
+def evaluate_split(name, y_true, y_proba, threshold=0.5, prefix="GWO_XGB"):
+    y_pred = (y_proba >= threshold).astype(int)
+
+    auc  = roc_auc_score(y_true, y_proba)
+    acc  = accuracy_score(y_true, y_pred)
+    f1   = f1_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred)
+    rec  = recall_score(y_true, y_pred)
+
+    cm = confusion_matrix(y_true, y_pred)
+    rep = classification_report(y_true, y_pred, digits=4)
+
+    ap = average_precision_score(y_true, y_proba)
+    fpr, tpr, _ = roc_curve(y_true, y_proba)
+
+    print(f"\n========== {name} ==========")
+    print(f"Threshold         : {threshold}")
+    print(f"Accuracy          : {acc:.4f}")
+    print(f"F1-score          : {f1:.4f}")
+    print(f"Precision         : {prec:.4f}")
+    print(f"Recall            : {rec:.4f}")
+    print(f"AUC (ROC)         : {auc:.4f}")
+    print(f"Average Precision : {ap:.4f}")
+    print("Confusion Matrix:\n", cm)
+    print("Classification Report:\n", rep)
+
+    # ROC
+    plt.figure(figsize=(6, 5), dpi=300)
+    plt.plot(fpr, tpr, label=f"{prefix} (AUC={auc:.3f})")
+    plt.plot([0, 1], [0, 1], "--", label="Random")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve ({name})")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig(f"roc_{prefix}_{name.lower()}.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
+
+
+# ------------------------------------------------------------
+# 6) SHAP analysis (NO normalization; use raw feature values)
+# ------------------------------------------------------------
+def shap_analysis(model, X_df, feature_names, out_prefix="SHAP_GWO_XGB"):
+    """
+    SHAP analysis for XGBoost (NO normalization)
+    Outputs:
+      - SHAP plots (show + save)
+      - Excel:
+          * SHAP_values.xlsx
+          * SHAP_importance.xlsx
+          * SHAP_with_features.xlsx
+    """
+
+    # -----------------------------
+    # Prepare data
+    # -----------------------------
+    if not isinstance(X_df, pd.DataFrame):
+        X_df = pd.DataFrame(X_df, columns=feature_names)
+    else:
+        X_df = X_df[feature_names].copy()
+
+    # Subsample for SHAP (speed)
+    X_use = X_df.copy()
+    if len(X_use) > SHAP_MAX_SAMPLES:
+        X_use = X_use.sample(n=SHAP_MAX_SAMPLES, random_state=RANDOM_STATE)
+
+    # -----------------------------
+    # SHAP computation
+    # -----------------------------
+    explainer = shap.TreeExplainer(model)
+    shap_out = explainer(X_use)
+
+    shap_vals = np.array(shap_out.values)
+
+    # Binary classification → take class 1
+    if shap_vals.ndim == 3:
+        shap_vals = shap_vals[:, :, 1]
+
+    # -----------------------------
+    # 1) EXPORT SHAP VALUES (per sample)
+    # -----------------------------
+    shap_values_df = pd.DataFrame(
+        shap_vals,
+        columns=feature_names,
+        index=X_use.index
+    )
+
+    shap_values_df.to_excel(
+        f"{out_prefix}_shap_values.xlsx",
+        index=False
+    )
+
+    # -----------------------------
+    # 2) EXPORT SHAP IMPORTANCE (mean |SHAP|)
+    # -----------------------------
+    shap_importance = pd.DataFrame({
+        "Feature": feature_names,
+        "MeanAbsSHAP": np.mean(np.abs(shap_vals), axis=0)
+    }).sort_values("MeanAbsSHAP", ascending=False)
+
+    shap_importance["Rank"] = np.arange(1, len(shap_importance) + 1)
+
+    shap_importance.to_excel(
+        f"{out_prefix}_shap_importance.xlsx",
+        index=False
+    )
+
+    # -----------------------------
+    # 3) EXPORT SHAP + FEATURE VALUES (mechanism analysis)
+    # -----------------------------
+    shap_with_features = pd.concat(
+        [
+            X_use.reset_index(drop=True).add_suffix("_value"),
+            shap_values_df.reset_index(drop=True).add_suffix("_shap")
+        ],
+        axis=1
+    )
+
+    shap_with_features.to_excel(
+        f"{out_prefix}_shap_with_features.xlsx",
+        index=False
+    )
+
+    # -----------------------------
+    # 4) SHAP PLOTS (SHOW + SAVE)
+    # -----------------------------
+
+    # Beeswarm
+    plt.figure(figsize=(8, 6), dpi=SHAP_DPI)
+    shap.summary_plot(shap_vals, X_use, show=False)
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_summary_beeswarm.png", dpi=SHAP_DPI)
+    plt.show()
+    plt.close()
+
+    # Bar plot
+    plt.figure(figsize=(8, 6), dpi=SHAP_DPI)
+    shap.summary_plot(shap_vals, X_use, plot_type="bar", show=False)
+    plt.tight_layout()
+    plt.savefig(f"{out_prefix}_summary_bar.png", dpi=SHAP_DPI)
+    plt.show()
+    plt.close()
+
+    # Dependence plots (Top features)
+    top_feats = shap_importance["Feature"].iloc[:SHAP_TOP_DEP]
+
+    for feat in top_feats:
+        plt.figure(figsize=(7, 5), dpi=SHAP_DPI)
+        shap.dependence_plot(
+            feat, shap_vals, X_use,
+            interaction_index=None,
+            show=False
+        )
+        plt.tight_layout()
+        safe_name = feat.replace("/", "_").replace(" ", "_")
+        plt.savefig(f"{out_prefix}_dependence_{safe_name}.png", dpi=SHAP_DPI)
+        plt.show()
+        plt.close()
+
+    # -----------------------------
+    # SUMMARY LOG
+    # -----------------------------
+    print("\n[SHAP EXPORT]")
+    print(f"✔ {out_prefix}_shap_values.xlsx")
+    print(f"✔ {out_prefix}_shap_importance.xlsx")
+    print(f"✔ {out_prefix}_shap_with_features.xlsx")
+    print(f"✔ SHAP plots saved & displayed")
+
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    # 1) Load train/test (for optimization + evaluation)
+    train_df, test_df = load_and_build_datasets()
+
+    # 2) X, y (NO scaling)
+    X_train, y_train, X_test, y_test, X_train_df, X_test_df = prepare_xy(train_df, test_df)
+
+    # 3) imbalance weight
+    spw, counter = compute_scale_pos_weight(y_train)
+    print("\nTrain class distribution:", counter)
+    print(f"scale_pos_weight = {spw:.3f}")
+
+    # 4) GWO optimize
+    best_pos, best_cv_f1 = gwo_optimize(N_WOLVES, MAX_ITER, X_train, y_train, spw)
+    best_params = decode_wolf(best_pos, spw)
+
+    print("\n=============================")
+    print("GWO finished.")
+    print(f"Best CV F1 = {best_cv_f1:.4f}")
+    print("Best params:")
+    for k, v in best_params.items():
+        print(f"  {k}: {v}")
+
+    # 5) Train final model
+    best_model = XGBClassifier(**best_params)
+    best_model.fit(X_train, y_train)
+
+    # 6) Evaluate TEST + TRAIN
+    y_proba_test  = best_model.predict_proba(X_test)[:, 1]
+    y_proba_train = best_model.predict_proba(X_train)[:, 1]
+
+    evaluate_split("TEST",  y_test,  y_proba_test,  threshold=THRESHOLD, prefix="GWO_XGB")
+    evaluate_split("TRAIN", y_train, y_proba_train, threshold=THRESHOLD, prefix="GWO_XGB")
+
+    # 7) SHAP data (you requested: use LS_2_aftercheck.xlsx + Non_LS_2_aftercheck.xlsx)
+    LS_SHAP_XLSX  = "LS_SHAP_combine.xlsx"
+    NLS_SHAP_XLSX = "Non_LS_SHAP_combine.xlsx"
+
+    df_ls_shap  = pd.read_excel(LS_SHAP_XLSX)
+    df_nls_shap = pd.read_excel(NLS_SHAP_XLSX)
+
+    # Build SHAP feature matrix ONLY (no Label needed for SHAP)
+    
+    
+    FEATURE_NAMES11 = [
+        "DEM",
+        "Slope",
+        "Aspect",
+        "Curvature",
+        "TWI",
+        "TRI",
+        "DS",
+        "Soil type",
+        "Geology",
+        "Forest density",
+        "Timper age",
+        "Tree diameter",
+        "Forest type",
+    ]
+    
+    missing_shap = [c for c in FEATURE_NAMES11 if (c not in df_ls_shap.columns) or (c not in df_nls_shap.columns)]
+    if missing_shap:
+        raise ValueError(f"Missing feature columns in SHAP Excel files: {missing_shap}")
+
+    X_shap_df = pd.concat(
+        [df_ls_shap[FEATURE_NAMES11], df_nls_shap[FEATURE_NAMES11]],
+        ignore_index=True
+    )
+
+    shap_analysis(best_model, X_shap_df, FEATURE_NAMES11, out_prefix="SHAP_GWO_XGB")
